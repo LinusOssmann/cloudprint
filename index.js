@@ -101,7 +101,7 @@ app.get('/', function(req, res) {
 
 } );
 
-res.delete('/', function(req, res) {
+app.delete('/', function(req, res) {
     //get request parameters: token, mac, type, code
     let token = req.query.token;
     let mac = req.query.mac;
