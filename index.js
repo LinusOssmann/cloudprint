@@ -1,107 +1,102 @@
-// initialize express and connect to mongodb server
+require('dotenv').config();
+const basicAuth = require('express-basic-auth')
+const express = require('express');
+const bodyParser = require('body-parser');
+const mongoose = require('mongoose');
 
-var express = require('express');
-var app = express();
-var bodyParser = require('body-parser');
-var mongoose = require('mongoose');
-var port = 9999;
+let app = express();
+const port = process.env.EXPOSE_PORT || 9999;
 
-// connect to mongodb server
-mongoose.connect('mongodb://mongo-express.cloudprint.127.0.0.1.nip.io/cloudprint');
+const clientAuthInstance = basicAuth({
+    users: {[process.env.CLOUDPRINT_AUTH_USER]: process.env.CLOUDPRINT_AUTH_PWD},
+    challenge: true,
+})
 
+const jobCreatorAuthInstance = basicAuth({
+    users: {[process.env.CREATE_AUTH_USER]: process.env.CREATE_AUTH_PWD},
+    challenge: true,
+})
 
-const printJob = require('./Models/printJob');
-mongoose.model("printJob", printJob);
-
-// use body parser to get data from POST
 app.use(bodyParser.urlencoded({extended: true}));
 app.use(bodyParser.json());
 
-app.post('/', function(req, res) {
+const mongoDB = process.env.MONGODB_URI || 'mongodb://localhost:27017/cloudprint';
+mongoose.connect(mongoDB);
+const printJob = require('./Models/printJob');
+const printJobCollection = mongoose.model("printJob", printJob);
+
+//implement basic auth for all routes accept /printjobs
+app.use(function (req, res, next) {
+    if (req.path === "/printjobs") {
+        jobCreatorAuthInstance(req, res, next);
+        return;
+    } else {
+        clientAuthInstance(req, res, next);
+    }
+} );
+
+app.post('/', async function (req, res) {
     let status = req.body.status;
     let printerMAC = req.body.printerMAC;
     let statusCode = req.body.statusCode;
     let printingInProgress = req.body.printingInProgress;
 
-    // if any of the required fields are missing, return an error
-    if (!status || !printerMAC || !statusCode || !printingInProgress) {
-        res.send("Error: Missing required fields" );
+    if (!status || !printerMAC || !statusCode) {
+        console.log("Error: Missing required fields", req.body);
+        return res.send("Error: Missing required fields");
     }
 
     let responseBody = {
-        hasPrintJob: false,
-        mediaTypes: ["text/plain", "image/png"]
+        jobReady: false,
+        mediaTypes: ["text/plain"]
     };
 
-    mongoose.get("printJob").find({status: "ópen"}, function(err, printJobs) {
-        if (err) {
-            res.send(err);
-        }
-        if (printJobs.length > 0) {
-            responseBody.hasPrintJob = true;
-            let printJob = printJobs[0];
-            responseBody.printJobId = printJob.id;
-            printJob.printer = printerMAC;
-            printJob.status = "assigned";
-            printJob.save(function(err) {
-                if (err) {
-                    res.send(err);
-                }
-            } );
-        }
+    let printJob = await printJobCollection.findOne({status: "open"});
 
-    });
+    if (printJob && !printingInProgress) {
+        responseBody.jobReady = true;
+        responseBody.jobToken = printJob.id;
 
+        printJob.printer = printerMAC;
+        printJob.status = "assigned";
+        await printJob.save();
+    }
 
-
-
-
-
+    console.log("PrintJob sent", responseBody)
+    return res.json(responseBody);
 });
 
-app.get('/', function(req, res) {
-    //get request parameters: token, mac, type
+app.get('/', async function (req, res) {
     let token = req.query.token;
     let mac = req.query.mac;
     let mediaType = req.query.type;
 
-    // if any of the required fields are missing, return an error
-    if (!token || !mac || !mediaType) {
-        res.send("Error: Missing required fields", 404);
+    if (!mac || !mediaType) {
+        return res.status(404).send("Error: Missing required fields");
+    }
+    if (mediaType !== "text/plain" && mediaType !== "image/png") {
+        return res.status(415).send("Error: Unsupported media type");
     }
 
-    if(mediaType != "text/plain" && mediaType != "image/png") {
-        res.send("Error: Unsupported media type", 415);
+    let printJobs = await printJobCollection.find({printer: mac, status: "assigned"});
+    if (printJobs.length === 0) {
+        return res.status(403).send("Error: Invalid token");
+    }
+    if (mac != printJobs[0].printer) {
+        return res.status(403).send("Error: Invalid printer");
     }
 
-    res.setHeader("X-Star-Buzzerstartpattern", "1");
+    let printJob = printJobs[0];
+    printJob.status = "printing";
+    await printJob.save();
 
-    // find the printJob with the given token
-    mongoose.get("printJob").find({token: token}, function(err, printJobs) {
-        if (err || printJobs.length == 0) {
-            res.send("Error or Not Found", 404);
-        }
+    res.setHeader("X-Star-Document-Type", "StarLine");
+    res.setHeader("Content-Type", "text/plain");
 
-        if (mac != printJobs[0].printer) {
-            res.send("Error: Invalid printer", 403);
-        }
+    return res.send(printJob.content);
+});
 
-        let printJob = printJobs[0];
-        printJob.status = "printing";
-        printJob.save(function(err) {
-            if (err) {
-                res.send("Error", 404);
-            }
-        } );
-
-        res.send(printJob.content);
-    } );
-
-
-
-} );
-
-app.delete('/', function(req, res) {
+app.delete('/', async function (req, res) {
     //get request parameters: token, mac, type, code
     let token = req.query.token;
     let mac = req.query.mac;
@@ -110,42 +105,44 @@ app.delete('/', function(req, res) {
 
     // if any of the required fields are missing, return an error
     if (!token || !mac || !mediaType || !code) {
-        res.send("Error: Missing required fields", 404);
+        return res.status(404).send("Error: Missing required fields");
     }
 
-    mongoose.get("printJob").find({token: token}, function(err, printJobs) {
-        if (err || printJobs.length == 0) {
-            res.send("Error or Not Found", 404);
-        }
+    let printJobs = await printJobCollection.find({id: token});
+    let printJob = printJobs[0];
+    if (mac != printJob.printer) {
+        return res.status(403).send("Error: Invalid printer");
+    }
 
-        let printJob = printJobs[0];
+    let status = "confirmed"
+    if (code !== "OK") {
+        status = "open";
+    } else {
+        printJob.finishedAt = Date.now();
+    }
 
-        if (mac != printJob.printer) {
-            res.send("Error: Invalid printer", 403);
+    printJob.status = status;
+    await printJob.save();
 
-        }
+    return res.send("OK");
+});
 
-        let status = "confirmed"
-        if (code !== "OK") {
-            status = "open";
-        } else {
-            printJob.finishedAt = Date.now();
-        }
+app.post('/printjobs', async function (req, res) {
+    basicAuth({
+        users: {[process.env.CLOUDPRINT_AUTH_USER]: process.env.CLOUDPRINT_AUTH_PWD},
+        challenge: true,
+    })
 
+    let printJob = new printJobCollection();
+    printJob.content = req.body.content;
+    printJob.status = "open";
+    printJob.createdAt = Date.now();
+    printJob.id = Math.floor(Math.random() * 1000000000);
+    await printJob.save();
 
-        printJob.status = status;
-        printJob.save(function(err) {
-            if (err) {
-                res.send("Error", 404);
-            }
-        } );
-    } );
-
-    res.send("OK");
-} );
+    res.json({message: "PrintJob created"});
+});
 
 app.listen(port);
 console.log('Server running on port ' + port);
-
-// expose app
 exports = module.exports = app;
